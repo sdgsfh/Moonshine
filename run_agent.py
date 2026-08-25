@@ -1502,11 +1502,17 @@ class AIAgent(object):
                     state.fallback_response_reasoning_content = response.reasoning_content if str(response.reasoning_content or "").strip() else ""
 
                 prepared_calls, invalid_batch = self._prepare_tool_calls(state, response.tool_calls)
-                if state.tool_rounds >= state.budget.max_tool_rounds:
-                    # Do not append an assistant tool-call message that we cannot follow
-                    # with matching tool messages: strict OpenAI-compatible endpoints
-                    # (e.g. DeepSeek) reject the next request with HTTP 400
-                    # ("insufficient tool messages following tool_calls").
+                # The tool-round budget gates only REAL executable rounds. The
+                # invalid-batch / no-executable paths are validation-feedback paths that
+                # attach synthetic tool results and do NOT consume a tool round, so they
+                # must not be preempted by the budget guard below. We break before
+                # appending the assistant tool-call message so a gated round never leaves
+                # orphaned tool_calls (which strict OpenAI-compatible endpoints reject).
+                if (
+                    not invalid_batch
+                    and any(item.status == "execute" for item in prepared_calls)
+                    and state.tool_rounds >= state.budget.max_tool_rounds
+                ):
                     state.final_reason = "tool_round_limit_reached"
                     status_event = self._emit_status(
                         state,

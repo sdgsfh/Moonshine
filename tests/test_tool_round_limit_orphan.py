@@ -142,6 +142,87 @@ class ToolRoundLimitOrphanRegressionTest(unittest.TestCase):
                 % (call_index, orphans),
             )
 
+    def test_tool_round_limit_keeps_validation_feedback_path(self):
+        """Budget exhaustion must not skip the invalid-batch / no-executable feedback path.
+
+        These are validation-feedback paths: they append synthetic tool results and do
+        NOT increment tool_rounds, so they must still run once the tool-round budget is
+        exhausted. Before the fix, the max_tool_rounds guard `break` before reaching
+        them, denying the model a chance to repair an invalid batch.
+        """
+        self.app.config.agent.max_tool_rounds = 1  # exhaust after the first tool execution
+        self.app.config.agent.max_model_rounds = 6
+
+        provider = ScriptedProvider(
+            [
+                # round 1: a valid tool call -> executes (tool_rounds 0 -> 1, cap reached).
+                {
+                    "response": ProviderResponse(
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="query_memory",
+                                arguments={"query": "Krull dimension first", "project_slug": "anderson_conjecture"},
+                                call_id="call-1",
+                            )
+                        ]
+                    )
+                },
+                # round 2: budget exhausted, but the model returns an INVALID tool batch.
+                # The guard must NOT preempt the validation-feedback path: the model should
+                # still get the synthetic "unknown tool" result so it can repair.
+                {
+                    "response": ProviderResponse(
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="totally_unknown_tool",
+                                arguments={"query": "local methods", "project_slug": "anderson_conjecture"},
+                                call_id="call-2",
+                            )
+                        ]
+                    )
+                },
+                # round 3: the model repairs and returns a valid tool call. It should run
+                # even though tool_rounds is still 1 (feedback path does not consume budget).
+                {
+                    "response": ProviderResponse(
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="query_memory",
+                                arguments={"query": "local methods", "project_slug": "anderson_conjecture"},
+                                call_id="call-3",
+                            )
+                        ]
+                    )
+                },
+                # finalization pass: plain text.
+                {
+                    "chunks": ["Finalized the run."],
+                    "response": ProviderResponse(content="Finalized the run."),
+                },
+            ]
+        )
+        self.app.agent.provider = provider
+
+        events = list(self.app.ask_stream("Run tools until the budget hits.", self.state))
+        status_texts = [event.text for event in events if event.type == "status"]
+
+        # The invalid batch must still surface its validation feedback (synthetic result),
+        # i.e. the guard must not preempt the path that tells the model the tool is unknown.
+        tool_errors = [e for e in events if e.type == "tool_error"]
+        self.assertTrue(
+            tool_errors,
+            "validation feedback for the invalid batch was skipped; expected an "
+            "'unknown tool' tool_result error to reach the model",
+        )
+        self.assertTrue(
+            any("unknown tool" in str(e.payload.get("error", "")).lower() for e in tool_errors),
+            "expected the error to mention an unknown tool",
+        )
+        # The repaired valid call is still executed (budget was not consumed by feedback).
+        self.assertTrue(any(e.type == "tool_result" for e in events))
+        self.assertEqual(events[-1].text, "Finalized the run.")
+        self._assert_no_orphan_tool_calls_across_provider_calls(provider)
+
     def test_tool_round_limit_does_not_leave_orphan_tool_calls(self):
         self.app.config.agent.max_tool_rounds = 1  # exhaust after the first tool execution
         self.app.config.agent.max_model_rounds = 6
