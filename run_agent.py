@@ -1031,32 +1031,60 @@ class AIAgent(object):
         return False
 
     def _sanitize_provider_messages(self, messages):
-        """Demote assistant tool_calls that lack matching tool messages to plain text.
+        """Demote unpaired tool-call protocol debris to plain text.
 
         Strict OpenAI-compatible endpoints (OpenAI/Azure/DeepSeek/vLLM) reject orphaned
-        tool_calls with HTTP 400, so requests must never contain them.
+        tool_calls with HTTP 400, so requests must never contain them. Pairing is
+        enforced in both directions: assistant tool_calls without matching tool
+        messages are demoted to plain text, and tool messages answering no declared
+        tool_call (stray results, or results with no preceding assistant tool-call
+        message at all) are demoted as well, since the same validators reject them.
         """
+        def fold_tool_results(tool_messages):
+            return "\n\n".join(
+                "Tool %s result:\n%s"
+                % (str(item.get("tool_call_id") or "?"), str(item.get("content") or ""))
+                for item in tool_messages
+            )
+
         result = []
         i, n = 0, len(messages or [])
         while i < n:
             msg = dict(messages[i])
+            if msg.get("role") == "assistant" and "tool_calls" in msg and not msg.get("tool_calls"):
+                # Empty tool_calls arrays are protocol noise some validators reject.
+                msg.pop("tool_calls", None)
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 ids = [str(tc.get("id") or "") for tc in msg["tool_calls"]]
                 j = i + 1
-                seen = set()
+                following = []
                 while j < n and messages[j].get("role") == "tool":
-                    seen.add(str(messages[j].get("tool_call_id") or ""))
+                    following.append(messages[j])
                     j += 1
-                if any(t not in seen for t in ids):
-                    folded = "\n\n".join(
-                        "Tool %s result:\n%s"
-                        % (str(messages[k].get("tool_call_id") or "?"), str(messages[k].get("content") or ""))
-                        for k in range(i + 1, j)
+                matched = [item for item in following if str(item.get("tool_call_id") or "") in ids]
+                stray = [item for item in following if str(item.get("tool_call_id") or "") not in ids]
+                answered = {str(item.get("tool_call_id") or "") for item in matched}
+                if any(declared not in answered for declared in ids):
+                    # Some declared call went unanswered: demote the whole group and
+                    # fold every following result into it. Provider-specific fields
+                    # (e.g. reasoning_content) are intentionally dropped here.
+                    text = "\n\n".join(
+                        part for part in (str(msg.get("content") or "").strip(), fold_tool_results(following)) if part
                     )
-                    text = "\n\n".join(p for p in (str(msg.get("content") or "").strip(), folded) if p)
                     result.append({"role": "assistant", "content": text or "[tool calls not executed]"})
                     i = j
                     continue
+                result.append(msg)
+                result.extend(dict(item) for item in matched)
+                if stray:
+                    result.append({"role": "assistant", "content": fold_tool_results(stray)})
+                i = j
+                continue
+            if msg.get("role") == "tool":
+                # Stray tool result with no preceding assistant tool_calls.
+                result.append({"role": "assistant", "content": fold_tool_results([msg])})
+                i += 1
+                continue
             result.append(msg)
             i += 1
         return result

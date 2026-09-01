@@ -120,6 +120,57 @@ class ProviderMessageSanitizerTest(unittest.TestCase):
     def test_empty_input_returns_empty(self):
         self.assertEqual(self._sanitize([]), [])
 
+    def test_lone_tool_message_without_preceding_tool_calls_is_demoted(self):
+        """A role=tool message answering no assistant tool_calls is rejected by strict
+        endpoints too, so it must be demoted to plain assistant text."""
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call-x", "content": "orphan result"},
+            {"role": "user", "content": "go on"},
+        ]
+        cleaned = self._sanitize(messages)
+        self.assertFalse(any(m.get("role") == "tool" for m in cleaned))
+        self.assertEqual(cleaned[0]["role"], "user")
+        self.assertEqual(cleaned[1]["role"], "assistant")
+        self.assertNotIn("tool_calls", cleaned[1])
+        self.assertIn("orphan result", cleaned[1]["content"])
+        self.assertEqual(cleaned[2]["role"], "user")
+
+    def test_stray_tool_messages_after_a_paired_group_are_folded(self):
+        """All declared calls are answered, but an extra tool message with an unknown
+        id trails the group: keep the pair intact, demote only the stray result."""
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call-a", "function": {}}]},
+            {"role": "tool", "tool_call_id": "call-a", "content": "ok"},
+            {"role": "tool", "tool_call_id": "call-EXTRA", "content": "stray"},
+            {"role": "user", "content": "next"},
+        ]
+        cleaned = self._sanitize(messages)
+        self.assertEqual(cleaned[0].get("tool_calls"), [{"id": "call-a", "function": {}}])
+        self.assertEqual(cleaned[1], {"role": "tool", "tool_call_id": "call-a", "content": "ok"})
+        self.assertEqual(cleaned[2]["role"], "assistant")
+        self.assertNotIn("tool_calls", cleaned[2])
+        self.assertIn("stray", cleaned[2]["content"])
+        self.assertEqual(cleaned[3]["role"], "user")
+        self.assertEqual(_orphan_tool_call_groups(cleaned), [])
+
+    def test_empty_tool_calls_list_is_dropped(self):
+        messages = [{"role": "assistant", "content": "x", "tool_calls": []}]
+        cleaned = self._sanitize(messages)
+        self.assertNotIn("tool_calls", cleaned[0])
+        self.assertEqual(cleaned[0]["content"], "x")
+
+    def test_sanitize_is_idempotent(self):
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "trying", "tool_calls": [{"id": "call-1", "function": {}}]},
+            {"role": "tool", "tool_call_id": "call-9", "content": "stray"},
+            {"role": "user", "content": "next"},
+        ]
+        once = self._sanitize(messages)
+        twice = self._sanitize(once)
+        self.assertEqual(once, twice)
+
 
 class ToolRoundLimitOrphanRegressionTest(unittest.TestCase):
     """Ensure tool-round-limit finalization never produces orphan tool_calls."""
@@ -149,6 +200,12 @@ class ToolRoundLimitOrphanRegressionTest(unittest.TestCase):
         NOT increment tool_rounds, so they must still run once the tool-round budget is
         exhausted. Before the fix, the max_tool_rounds guard `break` before reaching
         them, denying the model a chance to repair an invalid batch.
+
+        Note the budget stays a HARD cap on real executions: once exhausted, a
+        subsequently repaired valid call does NOT execute — the guard finalizes the
+        run instead. Letting repaired calls run past the cap would make the budget
+        bypassable by alternating invalid/valid batches (validation retries reset on
+        every valid batch), so only the feedback path survives exhaustion.
         """
         self.app.config.agent.max_tool_rounds = 1  # exhaust after the first tool execution
         self.app.config.agent.max_model_rounds = 6
@@ -181,8 +238,9 @@ class ToolRoundLimitOrphanRegressionTest(unittest.TestCase):
                         ]
                     )
                 },
-                # round 3: the model repairs and returns a valid tool call. It should run
-                # even though tool_rounds is still 1 (feedback path does not consume budget).
+                # round 3: the model repairs and returns a valid tool call. The budget is
+                # a hard cap, so the guard gates this round and finalizes instead of
+                # executing it — only the feedback path (round 2) survives exhaustion.
                 {
                     "response": ProviderResponse(
                         tool_calls=[
@@ -218,9 +276,62 @@ class ToolRoundLimitOrphanRegressionTest(unittest.TestCase):
             any("unknown tool" in str(e.payload.get("error", "")).lower() for e in tool_errors),
             "expected the error to mention an unknown tool",
         )
-        # The repaired valid call is still executed (budget was not consumed by feedback).
-        self.assertTrue(any(e.type == "tool_result" for e in events))
+        # The round-1 call really executed; the repaired call-3 was gated by the hard
+        # budget cap, so exactly one tool ran and no tool_call event exists for call-3.
+        executed_call_ids = [e.payload.get("call_id") for e in events if e.type == "tool_call"]
+        self.assertEqual(executed_call_ids, ["call-1"])
+        tool_results = [e for e in events if e.type == "tool_result"]
+        self.assertEqual(len(tool_results), 1)
+        self.assertEqual(tool_results[0].payload.get("call_id"), "call-1")
+        self.assertTrue(any("tool round limit" in event.text.lower() for event in events if event.type == "status"))
         self.assertEqual(events[-1].text, "Finalized the run.")
+        self._assert_no_orphan_tool_calls_across_provider_calls(provider)
+
+    def test_invalid_batch_repair_executes_within_budget(self):
+        """Normal repair flow: while budget remains, an invalid batch gets synthetic
+        feedback (no tool_round consumed) and the repaired valid call then executes."""
+        self.app.config.agent.max_tool_rounds = 1
+        self.app.config.agent.max_model_rounds = 6
+
+        provider = ScriptedProvider(
+            [
+                # round 1: invalid batch -> feedback, tool_rounds stays 0.
+                {
+                    "response": ProviderResponse(
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="totally_unknown_tool",
+                                arguments={"query": "x"},
+                                call_id="bad-1",
+                            )
+                        ]
+                    )
+                },
+                # round 2: repaired valid call -> budget remains, so it executes.
+                {
+                    "response": ProviderResponse(
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="query_memory",
+                                arguments={"query": "repaired", "project_slug": "anderson_conjecture"},
+                                call_id="good-1",
+                            )
+                        ]
+                    )
+                },
+                {
+                    "response": ProviderResponse(content="Repair flow done."),
+                },
+            ]
+        )
+        self.app.agent.provider = provider
+
+        events = list(self.app.ask_stream("Repair the batch.", self.state))
+
+        self.assertTrue(any(e.type == "tool_error" for e in events))
+        executed_call_ids = [e.payload.get("call_id") for e in events if e.type == "tool_call"]
+        self.assertEqual(executed_call_ids, ["good-1"])
+        self.assertEqual(events[-1].text, "Repair flow done.")
         self._assert_no_orphan_tool_calls_across_provider_calls(provider)
 
     def test_tool_round_limit_does_not_leave_orphan_tool_calls(self):
