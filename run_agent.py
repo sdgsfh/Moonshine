@@ -127,15 +127,6 @@ class AIAgent(object):
             return content
         return ""
 
-    def _configured_offline_provider_message(self) -> str:
-        """Return a concise terminal message for an explicitly offline main provider."""
-        note = str(getattr(self.provider, "note", "") or "").strip()
-        suffix = (" Provider note: %s" % note) if note else ""
-        return (
-            "Research autopilot stopped because the main provider is offline or unavailable.%s\n"
-            "Configure a working provider before continuing research mode."
-        ) % suffix
-
     def _verification_offline_error(self, results: Sequence[Dict[str, object]]) -> str:
         """Return the verification-provider offline tool error text if present."""
         for result in results:
@@ -1352,26 +1343,9 @@ class AIAgent(object):
         )
         final_already_streamed = False
 
-        if state.mode == "research" and isinstance(self.provider, OfflineProvider):
-            state.final_text = self._configured_offline_provider_message()
-            state.final_reason = "provider_offline"
-            self._append_turn_transcript(
-                state,
-                {
-                    "kind": "assistant_output",
-                    "content": state.final_text,
-                    "source": state.final_reason,
-                    "model_round": state.model_round,
-                },
-            )
-            status_event = self._emit_status(
-                state,
-                "Research autopilot stopped because the main provider is offline or unavailable.",
-                phase="provider_offline",
-            )
-            if status_event is not None:
-                yield status_event
-
+        # An offline main provider still runs one streaming round so the user
+        # sees the deterministic fallback text; the post-stream offline gate
+        # below then ends the turn with final_reason="provider_offline".
         while state.model_round < state.budget.max_model_rounds:
             if state.final_reason == "provider_offline":
                 break
