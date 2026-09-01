@@ -969,6 +969,7 @@ class AIAgent(object):
                 "created_at": utc_now(),
             }
             self.session_store.append_tool_event(state.session_id, event_payload)
+            self.session_store.append_tool_result_conversation_event(state.session_id, event_payload)
             self._append_turn_transcript(
                 state,
                 {
