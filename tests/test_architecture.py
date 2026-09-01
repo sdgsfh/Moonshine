@@ -7205,13 +7205,16 @@ description: Stale runtime builtin skill that no longer exists in packaged asset
         self.assertIn("verdict", verifier_task.schema["properties"])
 
     def test_structured_task_call_sites_use_structured_generation_and_validation_where_needed(self):
-        with open("moonshine/agent_runtime/extraction.py", encoding="utf-8") as handle:
+        # Resolve package sources relative to this file: the repo root is the moonshine package
+        # itself, so a cwd-relative "moonshine/..." path only works from the package parent.
+        package_root = Path(__file__).resolve().parents[1]
+        with open(package_root / "agent_runtime" / "extraction.py", encoding="utf-8") as handle:
             extraction_source = handle.read()
-        with open("moonshine/agent_runtime/research_mode.py", encoding="utf-8") as handle:
+        with open(package_root / "agent_runtime" / "research_mode.py", encoding="utf-8") as handle:
             project_source = handle.read()
-        with open("moonshine/agent_runtime/research_workflow.py", encoding="utf-8") as handle:
+        with open(package_root / "agent_runtime" / "research_workflow.py", encoding="utf-8") as handle:
             workflow_source = handle.read()
-        with open("moonshine/tools/verification_tools.py", encoding="utf-8") as handle:
+        with open(package_root / "tools" / "verification_tools.py", encoding="utf-8") as handle:
             verifier_source = handle.read()
 
         self.assertIn('get_structured_task("memory-trigger-decision")', extraction_source)
@@ -7226,7 +7229,9 @@ description: Stale runtime builtin skill that no longer exists in packaged asset
 
         self.assertIn("check_conclusion_gate", workflow_source)
         self.assertIn("build_autonomous_prompt", workflow_source)
-        self.assertIn("## Stage Transition", workflow_source)
+        # The stage-transition contract lives in SECTION_ALIASES["stage_transition"] and is parsed
+        # case-insensitively; the literal "## Stage Transition" header is not hardcoded in source.
+        self.assertIn("stage_transition", workflow_source)
         self.assertIn("research_log.md", workflow_source)
 
         self.assertIn("PESSIMISTIC_REVIEW_SCHEMA", verifier_source)
