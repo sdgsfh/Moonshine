@@ -365,6 +365,7 @@ AUTO_PROBLEM_DRAFT_MARKER = "<!-- moonshine:auto-problem-draft -->"
 
 SECTION_ALIASES = {
     "problem_draft": ["problem draft", "active problem", "current problem"],
+    "blueprint_draft": ["blueprint draft", "blueprint draft update", "proof blueprint draft"],
     "candidate_problem": ["candidate problem", "candidate problems"],
     "problem_review": ["problem review", "quality review"],
     "stage_transition": ["stage transition", "stage decision", "design decision"],
@@ -2510,11 +2511,12 @@ class ResearchWorkflowManager(object):
         state: ResearchWorkflowState,
         assistant_message: str,
     ) -> Dict[str, object]:
-        """Capture direct stage proposals from assistant output.
+        """Capture direct stage proposals and blueprint drafts from assistant output.
 
         Project research memory is updated from turn records separately. This
-        capture step deliberately avoids writing project drafts from assistant
-        sections.
+        capture step writes `## Blueprint Draft` sections into the canonical
+        blueprint workspace file so a later verification gate can be invalidated
+        when the proof text changes without a fresh verifier call.
         """
         capture = {
             "updated_files": [],
@@ -2525,6 +2527,21 @@ class ResearchWorkflowManager(object):
         message = str(assistant_message or "")
         if not message.strip():
             return capture
+
+        # Blueprint draft sections only count once the workflow is actually solving;
+        # during problem design they are premature and must not touch workspace files.
+        blueprint_blocks = self._section_bodies(message, "blueprint_draft") if state.stage == "problem_solving" else []
+        if blueprint_blocks:
+            blueprint_body = str(blueprint_blocks[-1] or "").strip()
+            if blueprint_body:
+                blueprint_path = self._append_workspace_draft(
+                    self._blueprint_draft_path(project_slug),
+                    blueprint_body,
+                    kind="blueprint",
+                    title="Blueprint Draft Update",
+                )
+                capture["updated_files"] = list(capture.get("updated_files") or []) + [blueprint_path]
+                capture["blueprint_updated"] = True
 
         transition_blocks = self._section_bodies(message, "stage_transition")
         if transition_blocks:
@@ -3288,6 +3305,23 @@ class ResearchWorkflowManager(object):
                 "blueprint_path": blueprint_relative,
                 "reason": str(state.final_verification_gate.get("reason") or "Final verification has passed."),
             }
+        if capture.get("blueprint_updated"):
+            gate = dict(state.final_verification_gate or _default_final_verification_gate())
+            verification = dict(state.verification or _default_verification())
+            if bool(gate.get("ready_for_final_verification")) or str(verification.get("verdict") or "") == "verified":
+                gate["ready_for_final_verification"] = False
+                gate["reason"] = (
+                    "The blueprint changed after the last verification; "
+                    "rerun final verification before relying on it."
+                )
+                state.final_verification_gate = gate
+                verification["verdict"] = "not_checked"
+                state.verification = verification
+                if str(state.status or "") == "completed":
+                    state.status = "active"
+                capture["verification_invalidated"] = True
+                workspace_reduction["blueprint_changed"] = True
+                workspace_reduction["verification_invalidated"] = True
         self._refresh_live_attempt_counters(state)
         self._refresh_live_state_assessment(state, session_id=session_id)
         checkpoint_meta = self.save_state(state, mirror_progress=False, checkpoint_reason="turn_refresh")
