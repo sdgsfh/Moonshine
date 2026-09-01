@@ -1881,6 +1881,21 @@ class ResearchWorkflowManager(object):
         """Compatibility no-op: scratchpad.md is no longer maintained by research mode."""
         return str(self._scratchpad_path(project_slug).relative_to(self.paths.home).as_posix())
 
+    def _ensure_workspace_scaffold(self, project_slug: str) -> None:
+        """Scaffold placeholder workspace files that compatibility readers expect to exist.
+
+        Research mode no longer maintains scratchpad.md contents, but the file
+        itself is still created once so workspace listings and readers find it.
+        """
+        scratchpad = self._scratchpad_path(project_slug)
+        if not scratchpad.exists():
+            atomic_write(
+                scratchpad,
+                "# Research Scratchpad\n\n"
+                "Scratchpad notes are no longer maintained by research mode; "
+                "project research memory lives in `memory/research_log.jsonl`.\n",
+            )
+
     def _publish_verified_blueprint(self, project_slug: str) -> str:
         """Copy the readable research log to the verified blueprint path for compatibility."""
         blueprint_text = read_text(self._blueprint_draft_path(project_slug)).strip()
@@ -2936,6 +2951,18 @@ class ResearchWorkflowManager(object):
         self._remember_recent_artifact(state, record)
         return applied
 
+    def _research_log_type_for_artifact(self, artifact_type: str) -> str:
+        """Map one research artifact type onto the canonical research-log record type."""
+        mapping = {
+            "candidate_problem": "problem",
+            "active_problem": "problem",
+            "problem_review": "verification",
+            "verification_report": "verification",
+            "failed_path": "failed_path",
+            "counterexample": "counterexample",
+        }
+        return mapping.get(str(artifact_type or "").strip(), "research_note")
+
     def record_artifact(
         self,
         *,
@@ -3417,6 +3444,7 @@ class ResearchWorkflowManager(object):
 
     def load_state(self, project_slug: str, seed: str = "") -> ResearchWorkflowState:
         """Load or initialize the workflow state for a project."""
+        self._ensure_workspace_scaffold(project_slug)
         try:
             payload = read_json(self._state_path(project_slug), default=None)
         except ValueError:

@@ -1861,6 +1861,41 @@ class ContextManager(object):
             locations["active_session"] = self.paths.session_dir(session_id).relative_to(self.paths.home).as_posix()
         locations["session_index"] = self.paths.sessions_db.relative_to(self.paths.home).as_posix()
 
+        research_hits_payload: List[Dict[str, object]] = []
+        compressed_windows: List[Dict[str, object]] = []
+        for item in research_log_hits:
+            hit_metadata = dict(item.get("metadata") or {})
+            record_type = str(item.get("type") or hit_metadata.get("record_type") or "research_note")
+            exact_excerpt = str(hit_metadata.get("exact_excerpt") or item.get("content_inline") or "")
+            raw_text = str(hit_metadata.get("raw_text") or item.get("content") or "")
+            retrieval_mode = str(hit_metadata.get("retrieval_mode") or "").strip() or "research_index"
+            title = str(item.get("title") or "")
+            research_hits_payload.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "source": "research-artifact",
+                    "type": record_type,
+                    "title": title,
+                    "content": raw_text,
+                    "exact_excerpt": exact_excerpt,
+                    "retrieval_mode": retrieval_mode,
+                    "score": float(item.get("score") or 0.0),
+                    "project_slug": str(item.get("project_slug") or ""),
+                    "session_id": str(item.get("session_id") or ""),
+                    "source_refs": list(item.get("source_refs") or []),
+                    "created_at": str(item.get("created_at") or ""),
+                }
+            )
+            compressed_windows.append(
+                {
+                    "source": "research-artifact",
+                    "type": record_type,
+                    "title": title,
+                    "window_excerpt": "Exact Slice [%s] %s\n%s"
+                    % (record_type, title, exact_excerpt or raw_text),
+                }
+            )
+
         return {
             "query": query,
             "scope": {
