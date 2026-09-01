@@ -105,6 +105,7 @@ class ProviderMessageSanitizerTest(unittest.TestCase):
         self.assertEqual(cleaned[0]["role"], "assistant")
         self.assertNotIn("tool_calls", cleaned[0])
         self.assertIn("result a", cleaned[0]["content"])
+        self.assertIn("call-a", cleaned[0]["content"])  # the folded id must survive for traceability
         self.assertEqual(cleaned[1]["role"], "user")
 
     def test_orphan_with_no_content_gets_placeholder_text(self):
@@ -115,7 +116,9 @@ class ProviderMessageSanitizerTest(unittest.TestCase):
         cleaned = self._sanitize(messages)
         self.assertEqual(cleaned[0]["role"], "assistant")
         self.assertNotIn("tool_calls", cleaned[0])
-        self.assertTrue(cleaned[0]["content"])
+        # empty-content assistant messages are rejected by some strict endpoints,
+        # so the placeholder must be a concrete non-empty marker
+        self.assertEqual(cleaned[0]["content"], "[tool calls not executed]")
 
     def test_empty_input_returns_empty(self):
         self.assertEqual(self._sanitize([]), [])
