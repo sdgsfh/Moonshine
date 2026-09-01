@@ -2503,7 +2503,6 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertTrue(any(event.type == "final" for event in events))
         self.assertIn("REAL_RUN_PROBLEM_SENTINEL", problem_text)
         self.assertNotIn("REAL_RUN_SCRATCHPAD_SENTINEL", scratchpad_text)
-
         self.assertNotIn("REAL_RUN_PROBLEM_SENTINEL", workflow_payload.get("active_problem", ""))
         self.assertNotIn("REAL_RUN_PROBLEM_SENTINEL", runtime_state.get("active_problem", ""))
         self.assertEqual(read_jsonl(self.app.paths.project_research_ledger_file("anderson_conjecture")), [])
@@ -2707,7 +2706,6 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertNotIn("scratchpad_updated", payload["capture"])
         self.assertNotIn("scratchpad.md", "\n".join(payload["updated_files"]))
         self.assertNotIn("singular case", scratchpad_text)
-
         self.assertNotIn("auto_commit", payload)
         self.assertNotIn("ledger_entry", payload)
         self.assertEqual(read_jsonl(self.app.paths.project_research_ledger_file("anderson_conjecture")), [])
@@ -3054,10 +3052,12 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             )
 
     # UPSTREAM DRIFT (turn-driven adaptive workflow retired): this test expects plain ask_stream
-    # turns to create and advance research_workflow.json. In this snapshot the turn pipeline only
-    # archives into research_log.jsonl (archive_after_turn: "without refreshing workflow state";
-    # observe_tool_result is a deliberate no-op; commit_turn is not exposed). Restoring turn-driven
-    # state-machine updates means re-wiring a retired subsystem, so mark expectedFailure.
+    # turns to create and advance the full adaptive workflow state machine. The turn pipeline
+    # archives into research_log.jsonl (archive_after_turn: "without refreshing workflow state")
+    # and commit_turn is not exposed to the model; observe_tool_result now folds retrieval and
+    # verification results into research memory but does not drive the full state machine this
+    # test asserts. Restoring it means re-wiring a retired subsystem, so mark expectedFailure.
+
     @unittest.expectedFailure
     def test_research_mode_completes_tool_assisted_adaptive_workflow(self):
         active_problem = "The finiteness criterion reduces to checks at maximal ideals."
@@ -3260,7 +3260,6 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertTrue(any(item["type"] == "project_result" for item in research_records))
 
     def test_research_mode_requires_explicit_stage_transition_section(self):
-
         active_problem = "Study the scripted local criterion problem."
         provider = ResearchWorkflowProvider(
             [
@@ -3389,10 +3388,12 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         self.assertFalse((self.app.paths.home / "workspace").exists())
 
     # UPSTREAM DRIFT (turn-driven adaptive workflow retired): this test expects plain ask_stream
-    # turns to create and advance research_workflow.json. In this snapshot the turn pipeline only
-    # archives into research_log.jsonl (archive_after_turn: "without refreshing workflow state";
-    # observe_tool_result is a deliberate no-op; commit_turn is not exposed). Restoring turn-driven
-    # state-machine updates means re-wiring a retired subsystem, so mark expectedFailure.
+    # turns to create and advance the full adaptive workflow state machine. The turn pipeline
+    # archives into research_log.jsonl (archive_after_turn: "without refreshing workflow state")
+    # and commit_turn is not exposed to the model; observe_tool_result now folds retrieval and
+    # verification results into research memory but does not drive the full state machine this
+    # test asserts. Restoring it means re-wiring a retired subsystem, so mark expectedFailure.
+
     @unittest.expectedFailure
     def test_research_mode_tracks_navigation_progress_from_visible_tool_results(self):
         provider = ScriptedProvider(
