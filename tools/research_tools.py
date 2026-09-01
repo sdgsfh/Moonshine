@@ -179,16 +179,27 @@ def record_research_artifact(
     set_as_active: bool = False,
     metadata: Optional[Dict[str, object]] = None,
 ) -> dict:
-    """Deprecated explicit artifact writer.
-
-    Research mode memory is managed by the project research-memory pipeline.
-    """
-    return {
-        "tool": "record_research_artifact",
-        "status": "deprecated",
-        "archived": False,
-        "message": "Explicit artifact recording is disabled; project research memory uses research_log.jsonl.",
-    }
+    """Persist one typed research artifact through the research workflow."""
+    manager = runtime.get("research_workflow")
+    if manager is None:
+        raise RuntimeError("research_workflow runtime is unavailable")
+    return manager.record_artifact(
+        project_slug=str(runtime.get("project_slug", "") or "general"),
+        session_id=str(runtime.get("session_id", "") or ""),
+        artifact_type=artifact_type,
+        title=title,
+        summary=summary,
+        content=content,
+        stage=stage,
+        focus_activity=focus_activity,
+        status=status,
+        review_status=review_status,
+        related_ids=related_ids,
+        tags=tags,
+        next_action=next_action,
+        set_as_active=set_as_active,
+        metadata=metadata,
+    )
 
 
 def _record_fixed_artifact(

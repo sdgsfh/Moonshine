@@ -2864,6 +2864,18 @@ class ResearchWorkflowManager(object):
         self._remember_recent_artifact(state, record)
         return applied
 
+    def _research_log_type_for_artifact(self, artifact_type: str) -> str:
+        """Map one research artifact type onto the canonical research-log record type."""
+        mapping = {
+            "candidate_problem": "problem",
+            "active_problem": "problem",
+            "problem_review": "verification",
+            "verification_report": "verification",
+            "failed_path": "failed_path",
+            "counterexample": "counterexample",
+        }
+        return mapping.get(str(artifact_type or "").strip(), "research_note")
+
     def record_artifact(
         self,
         *,
@@ -2883,21 +2895,70 @@ class ResearchWorkflowManager(object):
         set_as_active: bool = False,
         metadata: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        """Deprecated explicit artifact entry point.
-
-        Project research memory is managed by the project research-memory pipeline.
-        """
+        """Persist one typed research artifact into research_log.jsonl and apply it to the live state."""
+        artifact_type = str(artifact_type or "").strip() or "note"
+        title = str(title or "").strip()
+        summary = str(summary or "").strip()
+        metadata = dict(metadata or {})
+        created_at = utc_now()
+        record_id = deterministic_slug(
+            "%s %s %s" % (artifact_type, title, created_at),
+            summary,
+            prefix=artifact_type or "artifact",
+        )
+        channel = self._artifact_channel_for_type(artifact_type)
+        body = "\n\n".join(
+            part
+            for part in [summary, str(content or "").strip()]
+            if part
+        )
+        created = self.research_log.append_records(
+            project_slug,
+            [
+                {
+                    "id": record_id,
+                    "type": self._research_log_type_for_artifact(artifact_type),
+                    "title": title or summary or "Research artifact",
+                    "content": body,
+                    "session_id": session_id,
+                    "created_at": created_at,
+                }
+            ],
+        )
+        state = self.load_state(project_slug)
+        artifact_record = {
+            "id": record_id,
+            "artifact_type": artifact_type,
+            "channel": channel,
+            "title": title,
+            "summary": summary,
+            "content_inline": body,
+            "stage": stage,
+            "focus_activity": focus_activity,
+            "status": status,
+            "review_status": review_status,
+            "related_ids": list(related_ids or []),
+            "tags": list(tags or []),
+            "next_action": next_action,
+            "set_as_active": bool(set_as_active),
+            "metadata": metadata,
+            "created_at": created_at,
+        }
+        applied = self._apply_artifact_to_state(state, artifact_record)
+        self.save_state(state, mirror_progress=False, checkpoint_reason="record_artifact")
         return {
-            "id": "",
-            "artifact_type": str(artifact_type or "").strip(),
-            "title": str(title or "").strip(),
-            "stage": str(stage or ""),
-            "focus_activity": str(focus_activity or ""),
-            "status": "deprecated",
-            "content_path": "",
-            "summary": str(summary or ""),
-            "archived": 0,
-            "message": "Explicit artifact recording is disabled; project research memory uses research_log.jsonl.",
+            "id": record_id,
+            "artifact_type": artifact_type,
+            "channel": channel,
+            "title": title,
+            "stage": str(stage or state.stage),
+            "focus_activity": str(focus_activity or state.node),
+            "status": str(status or "recorded"),
+            "content_path": self._research_log_path(project_slug).relative_to(self.paths.home).as_posix(),
+            "summary": summary,
+            "archived": len(created),
+            "applied": applied,
+            "message": "",
         }
 
     def commit_turn(
