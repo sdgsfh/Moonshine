@@ -364,17 +364,22 @@ class AIAgent(object):
             tool_schemas=state.tool_schemas,
         )
         changed = json.dumps(compacted_messages, ensure_ascii=False) != json.dumps(state.provider_messages, ensure_ascii=False)
-        if not changed:
-            return False
-        state.provider_messages = compacted_messages
         state.overflow_recovery_attempts += 1
+        if changed:
+            state.provider_messages = compacted_messages
+        # Even when aggressive compaction cannot shrink the request further,
+        # still retry (bounded by overflow_retry_limit): the local token count
+        # is an estimate and the provider may accept a retried request.
         self._record_turn_event(
             state.session_id,
             "context_overflow_recovery",
-            "Recovered from a context overflow by aggressively compacting history.",
+            "Recovered from a context overflow by aggressively compacting history."
+            if changed
+            else "Context overflow recovery retry; no further compaction was available.",
             phase=phase,
             error=error_text,
             recovery_attempt=state.overflow_recovery_attempts,
+            compaction_changed=bool(changed),
             estimated_tokens=compression_meta.get("estimated_tokens", 0),
             summarized_messages=compression_meta.get("summarized_messages", 0),
             kept_recent_messages=compression_meta.get("kept_recent_messages", 0),
