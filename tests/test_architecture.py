@@ -2491,11 +2491,13 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
         workflow_payload = read_json(self.app.paths.project_research_workflow_file("anderson_conjecture"), default={})
         runtime_state = read_json(self.app.paths.project_research_runtime_state_file("anderson_conjecture"), default={})
         problem_text = self.app.paths.project_problem_draft_file("anderson_conjecture").read_text(encoding="utf-8")
-        scratchpad_text = self.app.paths.project_scratchpad_file("anderson_conjecture").read_text(encoding="utf-8")
+        # scratchpad.md is retired in this snapshot: ResearchWorkflowManager._write_scratchpad is a
+        # compatibility no-op, so a plain research turn must not create the file at all; archival
+        # (research_log.jsonl + workspace/problem.md) owns persistence instead.
 
         self.assertTrue(any(event.type == "final" for event in events))
         self.assertIn("REAL_RUN_PROBLEM_SENTINEL", problem_text)
-        self.assertNotIn("REAL_RUN_SCRATCHPAD_SENTINEL", scratchpad_text)
+        self.assertFalse(self.app.paths.project_scratchpad_file("anderson_conjecture").exists())
         self.assertNotIn("REAL_RUN_PROBLEM_SENTINEL", workflow_payload.get("active_problem", ""))
         self.assertNotIn("REAL_RUN_PROBLEM_SENTINEL", runtime_state.get("active_problem", ""))
         self.assertEqual(read_jsonl(self.app.paths.project_research_ledger_file("anderson_conjecture")), [])
@@ -2694,11 +2696,12 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             ),
         )
 
-        scratchpad_text = self.app.paths.project_scratchpad_file("anderson_conjecture").read_text(encoding="utf-8")
+        # scratchpad.md is retired in this snapshot (compatibility no-op writer); refresh_after_turn
+        # must ignore Scratchpad sections and must not create the file without a turn ledger.
 
         self.assertNotIn("scratchpad_updated", payload["capture"])
         self.assertNotIn("scratchpad.md", "\n".join(payload["updated_files"]))
-        self.assertNotIn("singular case", scratchpad_text)
+        self.assertFalse(self.app.paths.project_scratchpad_file("anderson_conjecture").exists())
         self.assertNotIn("auto_commit", payload)
         self.assertNotIn("ledger_entry", payload)
         self.assertEqual(read_jsonl(self.app.paths.project_research_ledger_file("anderson_conjecture")), [])
