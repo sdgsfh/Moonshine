@@ -2245,10 +2245,7 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
 
         self.assertTrue(state_path.exists())
         self.assertTrue(runtime_state_path.exists())
-        # scratchpad.md is retired in this snapshot: ResearchWorkflowManager._write_scratchpad is a
-        # compatibility no-op ("scratchpad.md is no longer maintained by research mode"), so project
-        # persistence must not create the file at all.
-        self.assertFalse(self.app.paths.project_scratchpad_file("anderson_conjecture").exists())
+        self.assertTrue(self.app.paths.project_scratchpad_file("anderson_conjecture").exists())
         self.assertTrue(self.app.paths.project_agents_file("anderson_conjecture").exists())
         self.assertTrue(self.app.paths.global_agents_file.exists())
         project_agents_text = self.app.paths.project_agents_file("anderson_conjecture").read_text(encoding="utf-8")
