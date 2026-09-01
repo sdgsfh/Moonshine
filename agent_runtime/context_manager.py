@@ -1827,7 +1827,7 @@ class ContextManager(object):
             compressed_windows.append(
                 {
                     "key": str(item.get("key") or ""),
-                    "source": source,
+                    "source": "research-artifact" if source == "research-log" else source,
                     "title": str(item.get("title") or ""),
                     "summary": str(
                         metadata.get("summary") or metadata.get("exact_excerpt") or item.get("text") or ""
@@ -1862,7 +1862,6 @@ class ContextManager(object):
         locations["session_index"] = self.paths.sessions_db.relative_to(self.paths.home).as_posix()
 
         research_hits_payload: List[Dict[str, object]] = []
-        compressed_windows: List[Dict[str, object]] = []
         for item in research_log_hits:
             hit_metadata = dict(item.get("metadata") or {})
             record_type = str(item.get("type") or hit_metadata.get("record_type") or "research_note")
@@ -1886,15 +1885,6 @@ class ContextManager(object):
                     "created_at": str(item.get("created_at") or ""),
                 }
             )
-            compressed_windows.append(
-                {
-                    "source": "research-artifact",
-                    "type": record_type,
-                    "title": title,
-                    "window_excerpt": "Exact Slice [%s] %s\n%s"
-                    % (record_type, title, exact_excerpt or raw_text),
-                }
-            )
 
         return {
             "query": query,
@@ -1915,7 +1905,7 @@ class ContextManager(object):
             "compressed_windows": compressed_windows,
             "sources": [dict(item) for item in merged],
             "research_log_hits": research_log_hits,
-            "research_hits": research_log_hits,
+            "research_hits": research_hits_payload,
             "dynamic_hits": self._serialize_dynamic_hit_rows(dynamic_hits),
             "session_hits": session_hits,
             "event_hits": event_hits,

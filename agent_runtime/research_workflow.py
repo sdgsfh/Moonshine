@@ -2992,7 +2992,7 @@ class ResearchWorkflowManager(object):
         normalized_artifact = str(artifact_type or "").strip() or "research_note"
         record_type = RESEARCH_ARTIFACT_LOG_TYPES.get(normalized_artifact) or normalize_research_log_type(normalized_artifact)
         clean_title = str(title or "").strip() or shorten(str(summary or content or ""), 80) or "Research artifact"
-        body = str(content or "").strip() or str(summary or "").strip()
+        body = "\n\n".join(part for part in (str(summary or "").strip(), str(content or "").strip()) if part)
         created_at = utc_now()
         state = self.load_state(project_slug)
         metadata = dict(metadata or {})
