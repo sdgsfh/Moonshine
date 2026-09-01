@@ -45,6 +45,15 @@ WORKFLOW_VERSION = 3
 RESEARCH_COMPRESSION_INPUT_TOKEN_BUDGET = 500000
 RESEARCH_ARCHIVE_INPUT_TOKEN_BUDGET = 100000
 
+# Tools whose results are folded into the verification digest log and workflow state.
+VERIFICATION_OBSERVATION_TOOLS = {
+    "pessimistic_verify",
+    "verify_overall",
+    "verify_correctness_assumption",
+    "verify_correctness_computation",
+    "verify_correctness_logic",
+}
+
 RESEARCH_FINAL_REPORT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -356,6 +365,7 @@ AUTO_PROBLEM_DRAFT_MARKER = "<!-- moonshine:auto-problem-draft -->"
 
 SECTION_ALIASES = {
     "problem_draft": ["problem draft", "active problem", "current problem"],
+    "blueprint_draft": ["blueprint draft", "blueprint draft update", "proof blueprint draft"],
     "candidate_problem": ["candidate problem", "candidate problems"],
     "problem_review": ["problem review", "quality review"],
     "stage_transition": ["stage transition", "stage decision", "design decision"],
@@ -2329,13 +2339,20 @@ class ResearchWorkflowManager(object):
         return 0
 
     def _refresh_live_attempt_counters(self, state: ResearchWorkflowState) -> None:
-        """Refresh attempt counters from persisted turn checkpoints plus the current activity."""
-        state.correction_attempts = self._count_turn_checkpoints(state.project_slug, "correction")
-        state.strengthening_attempts = self._count_turn_checkpoints(state.project_slug, "strengthening")
+        """Refresh attempt counters from persisted turn checkpoints plus the current activity.
+
+        Counters accumulate across refreshes: a correction/strengthening attempt
+        recorded by an earlier refresh stays counted when the workflow later moves
+        into a different activity.
+        """
+        correction = self._count_turn_checkpoints(state.project_slug, "correction")
+        strengthening = self._count_turn_checkpoints(state.project_slug, "strengthening")
         if state.node == "correction":
-            state.correction_attempts += 1
+            correction += 1
         if state.node == "strengthening":
-            state.strengthening_attempts += 1
+            strengthening += 1
+        state.correction_attempts = max(int(state.correction_attempts or 0), correction)
+        state.strengthening_attempts = max(int(state.strengthening_attempts or 0), strengthening)
 
     def _refresh_live_state_assessment(self, state: ResearchWorkflowState, *, session_id: str) -> None:
         """Recompute the snapshot assessment from current persisted evidence."""
@@ -2596,11 +2613,12 @@ class ResearchWorkflowManager(object):
         state: ResearchWorkflowState,
         assistant_message: str,
     ) -> Dict[str, object]:
-        """Capture direct stage proposals from assistant output.
+        """Capture direct stage proposals and blueprint drafts from assistant output.
 
         Project research memory is updated from turn records separately. This
-        capture step deliberately avoids writing project drafts from assistant
-        sections.
+        capture step writes `## Blueprint Draft` sections into the canonical
+        blueprint workspace file so a later verification gate can be invalidated
+        when the proof text changes without a fresh verifier call.
         """
         capture = {
             "updated_files": [],
@@ -2611,6 +2629,21 @@ class ResearchWorkflowManager(object):
         message = str(assistant_message or "")
         if not message.strip():
             return capture
+
+        # Blueprint draft sections only count once the workflow is actually solving;
+        # during problem design they are premature and must not touch workspace files.
+        blueprint_blocks = self._section_bodies(message, "blueprint_draft") if state.stage == "problem_solving" else []
+        if blueprint_blocks:
+            blueprint_body = str(blueprint_blocks[-1] or "").strip()
+            if blueprint_body:
+                blueprint_path = self._append_workspace_draft(
+                    self._blueprint_draft_path(project_slug),
+                    blueprint_body,
+                    kind="blueprint",
+                    title="Blueprint Draft Update",
+                )
+                capture["updated_files"] = list(capture.get("updated_files") or []) + [blueprint_path]
+                capture["blueprint_updated"] = True
 
         transition_blocks = self._section_bodies(message, "stage_transition")
         if transition_blocks:
@@ -3205,12 +3238,141 @@ class ResearchWorkflowManager(object):
         output: Dict[str, object],
         error: str = "",
     ) -> None:
-        """No-op observer.
+        """Fold one executed research-mode tool result into project research memory.
 
-        Tool events are saved in the session log by the caller. Project
-        research memory is updated from those saved turn records.
+        Retrieval tools (query_memory, search_knowledge, read_runtime_file) leave a
+        deduplicated navigation note in research_log.jsonl so later turns can see
+        which knowledge and reference reads already happened. Verification tools
+        append a compact verification digest (keyed by claim + proof/blueprint
+        context) and refresh the lightweight workflow state (verdict, pending
+        verification targets, claim registry, final gate).
         """
-        return
+        if str(error or "").strip():
+            return
+        tool = str(tool_name or "").strip()
+        if not tool or not isinstance(output, dict) or not output:
+            return
+        arguments = dict(arguments or {})
+        artifact: Optional[Dict[str, object]] = None
+        if tool == "query_memory":
+            artifact = self._tool_query_memory_artifact(arguments, output)
+        elif tool == "search_knowledge":
+            artifact = self._tool_search_knowledge_artifact(arguments, output)
+        elif tool == "read_runtime_file":
+            artifact = self._tool_read_runtime_artifact(
+                project_slug=project_slug,
+                arguments=arguments,
+                output=output,
+            )
+        if artifact:
+            self._append_tool_navigation_record(
+                project_slug,
+                session_id=session_id,
+                artifact=artifact,
+            )
+        if tool in VERIFICATION_OBSERVATION_TOOLS:
+            self._observe_verification_tool_result(
+                project_slug,
+                tool_name=tool,
+                arguments=arguments,
+                output=output,
+            )
+
+    def _append_tool_navigation_record(
+        self,
+        project_slug: str,
+        *,
+        session_id: str,
+        artifact: Dict[str, object],
+    ) -> Optional[Dict[str, object]]:
+        """Append one deduplicated navigation note built from a retrieval tool result."""
+        signature = str(artifact.get("signature") or "").strip()
+        if signature and self._recent_tool_signature_exists(project_slug, signature):
+            return None
+        record = {
+            "type": normalize_research_log_type(str(artifact.get("artifact_type") or "research_note")),
+            "title": str(artifact.get("title") or "").strip(),
+            "content": str(artifact.get("content") or artifact.get("summary") or "").strip(),
+            "session_id": str(session_id or ""),
+        }
+        if signature:
+            record["tool_signature"] = signature
+        created = self.research_log.append_records(project_slug, [record])
+        return created[0] if created else None
+
+    def _observe_verification_tool_result(
+        self,
+        project_slug: str,
+        *,
+        tool_name: str,
+        arguments: Dict[str, object],
+        output: Dict[str, object],
+    ) -> None:
+        """Record one verification tool result into the digest log and workflow state."""
+        state = self.load_state(project_slug)
+        passed = bool(output.get("passed"))
+        review_status = "passed" if passed else "failed"
+        claim = str(output.get("claim") or arguments.get("claim") or state.current_claim or "").strip()
+        summary = str(output.get("summary") or "").strip()
+        metadata = dict(arguments or {})
+        metadata.update(dict(output or {}))
+        metadata["tool"] = str(tool_name or "")
+        metadata["proof"] = str(arguments.get("proof") or output.get("proof") or "")
+        self._append_verification_digest(
+            project_slug,
+            claim=claim,
+            summary=summary or claim,
+            review_status=review_status,
+            status=str(output.get("status") or ""),
+            branch_id=state.active_branch_id,
+            metadata=metadata,
+        )
+        scope = str(output.get("scope") or arguments.get("scope") or "").strip().lower()
+        critical_errors = [str(item) for item in list(output.get("critical_errors") or [])]
+        if not passed:
+            state.verification = {
+                "verdict": "needs_correction",
+                "critical_errors": critical_errors,
+                "rationale": summary,
+            }
+            if claim:
+                state.pending_verification_items = _dedupe_strings(
+                    list(state.pending_verification_items or []) + [claim]
+                )
+            if claim:
+                self._register_claim(
+                    state,
+                    claim=claim,
+                    status="needs_correction",
+                    review_status="failed",
+                    branch_id=state.active_branch_id,
+                    summary=summary,
+                )
+        else:
+            if claim:
+                self._register_claim(
+                    state,
+                    claim=claim,
+                    status="verified",
+                    review_status="passed",
+                    branch_id=state.active_branch_id,
+                    summary=summary,
+                )
+            if scope == "final":
+                blueprint_path = str(output.get("blueprint_path") or arguments.get("blueprint_path") or "").strip()
+                state.verification = {
+                    "verdict": "verified",
+                    "critical_errors": [],
+                    "rationale": summary,
+                }
+                state.final_verification_gate = {
+                    "has_complete_answer": True,
+                    "ready_for_final_verification": True,
+                    "blueprint_path": blueprint_path,
+                    "reason": summary or "Final verification has passed.",
+                }
+                state.status = "completed"
+        self.save_state(state, mirror_progress=False, checkpoint_reason="verification_observed")
 
     def refresh_after_turn(
         self,
@@ -3323,6 +3485,23 @@ class ResearchWorkflowManager(object):
                 "blueprint_path": blueprint_relative,
                 "reason": str(state.final_verification_gate.get("reason") or "Final verification has passed."),
             }
+        if capture.get("blueprint_updated"):
+            gate = dict(state.final_verification_gate or _default_final_verification_gate())
+            verification = dict(state.verification or _default_verification())
+            if bool(gate.get("ready_for_final_verification")) or str(verification.get("verdict") or "") == "verified":
+                gate["ready_for_final_verification"] = False
+                gate["reason"] = (
+                    "The blueprint changed after the last verification; "
+                    "rerun final verification before relying on it."
+                )
+                state.final_verification_gate = gate
+                verification["verdict"] = "not_checked"
+                state.verification = verification
+                if str(state.status or "") == "completed":
+                    state.status = "active"
+                capture["verification_invalidated"] = True
+                workspace_reduction["blueprint_changed"] = True
+                workspace_reduction["verification_invalidated"] = True
         self._refresh_live_attempt_counters(state)
         self._refresh_live_state_assessment(state, session_id=session_id)
         checkpoint_meta = self.save_state(state, mirror_progress=False, checkpoint_reason="turn_refresh")

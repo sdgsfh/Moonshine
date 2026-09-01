@@ -1794,15 +1794,41 @@ class AIAgent(object):
         research_workflow_update: Dict[str, object] = {}
         if state.mode == "research" and state.final_reason not in self.OFFLINE_FINAL_REASONS:
             try:
+                self.research_workflow.refresh_after_turn(
+                    project_slug=state.project_slug,
+                    session_id=state.session_id,
+                    user_message=user_message,
+                    assistant_message=state.final_text,
+                )
+            except Exception as exc:
+                self._record_turn_event(
+                    state.session_id,
+                    "research_workflow_error",
+                    str(exc),
+                    traceback=traceback.format_exc(limit=4),
+                )
+            try:
                 status_event = self._emit_status(
                     state,
-                    "Updating project research memory from the completed turn.",
+                    "Archiving research progress from the completed turn.",
                     phase="research_archive",
                 )
                 if status_event is not None:
                     yield status_event
+                archival_inherits_main = bool(getattr(self.config.archival_provider, "inherit_from_main", True))
+                effective_archival = self.archival_provider
+                if archival_inherits_main and (
+                    effective_archival is None
+                    or isinstance(effective_archival, OfflineProvider)
+                    or not hasattr(effective_archival, "generate_structured")
+                ):
+                    # Archival inherits the main provider: track the CURRENT main
+                    # provider when the inherited slot cannot archive (e.g. it is the
+                    # stale offline default). An explicitly installed working archival
+                    # provider still wins.
+                    effective_archival = self.provider
                 archive_payload = self._archive_after_turn_with_provider(
-                    self.archival_provider,
+                    effective_archival,
                     project_slug=state.project_slug,
                     session_id=state.session_id,
                     user_message=user_message,
@@ -1810,12 +1836,8 @@ class AIAgent(object):
                     turn_context=list(state.turn_transcript),
                 )
                 archive_status = dict(archive_payload or {})
-                archival_inherits_main = bool(getattr(self.config.archival_provider, "inherit_from_main", True))
-                if (
-                    self._archive_provider_failed(archive_status)
-                    and not archival_inherits_main
-                    and self.archival_provider is not self.provider
-                ):
+                dedicated_archival = effective_archival is not self.provider
+                if self._archive_provider_failed(archive_status) and dedicated_archival:
                     status_event = self._emit_status(
                         state,
                         "Dedicated archival provider failed; retrying research memory update with the main provider.",
@@ -1842,7 +1864,7 @@ class AIAgent(object):
                     archive_payload = fallback_payload
                     archive_status = dict(archive_payload or {})
                 research_workflow_update = {"research_log_archive": archive_payload}
-                if self._archive_provider_failed(archive_status):
+                if self._archive_provider_failed(archive_status) and dedicated_archival:
                     state.final_reason = "archival_provider_offline"
                     status_event = self._emit_status(
                         state,
@@ -1853,10 +1875,15 @@ class AIAgent(object):
                     )
                     if status_event is not None:
                         yield status_event
-                elif archive_status.get("skipped"):
+                elif archive_status.get("skipped") or self._archive_provider_failed(archive_status):
+                    # Archival through the main provider is best-effort: when the
+                    # current provider cannot produce structured archive records the
+                    # turn still completed, so skip the archive without stopping an
+                    # autopilot run. Only a dedicated archival provider failure is fatal.
                     status_event = self._emit_status(
                         state,
-                        "Project research memory update skipped: %s" % str(archive_status.get("skipped")),
+                        "Project research memory update skipped: %s"
+                        % str(archive_status.get("skipped") or archive_status.get("error") or "archive unavailable"),
                         phase="research_archive",
                         research_log_archive=archive_status,
                     )
