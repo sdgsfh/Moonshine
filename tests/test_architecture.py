@@ -2486,6 +2486,13 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
             ],
         )
         self.app.agent.provider = provider
+        # Archival is a separate provider slot in this snapshot (resolve_archival_provider); replacing
+        # only agent.provider leaves archival on the offline default and the research-log archive pass
+        # is skipped, so wire the scripted provider into the archival slots too (same pattern as the
+        # other archival tests).
+        self.app.archival_provider = provider
+        self.app.agent.archival_provider = provider
+        self.app.agent.research_workflow.provider = provider
 
         events = list(self.app.ask_stream("Run one realistic research turn without explicit commit.", self.state))
         workflow_payload = read_json(self.app.paths.project_research_workflow_file("anderson_conjecture"), default={})
