@@ -1701,8 +1701,9 @@ class ContextManager(object):
                 limit=result_limit * max(1, len(research_log_types) or 1),
             )
 
+        research_only = bool(research_log_types) or saw_research_type_filter
         raw_hits: Dict[str, object] = {}
-        if not research_log_types and not saw_research_type_filter:
+        if not research_only:
             raw_hits = self.memory_manager.query_memory_sources(
                 query,
                 project_slug,
@@ -1714,12 +1715,28 @@ class ContextManager(object):
         dynamic_hits = list(raw_hits.get("dynamic_hits") or [])
         session_record_hits = list(raw_hits.get("session_record_hits") or [])
         knowledge_hits = list(raw_hits.get("knowledge_hits") or [])
+        session_hits = [
+            dict(item)
+            for item in session_record_hits
+            if str(item.get("record_type") or "") == "message"
+        ]
+        event_hits: List[Dict[str, object]] = []
+        if not research_only and self.session_store is not None:
+            try:
+                event_hits = self.session_store.search_conversation_events(
+                    query,
+                    limit=result_limit,
+                    project_slug=project_slug,
+                )
+            except Exception:
+                event_hits = []
 
         ranked_lists = [self._normalize_research_hits(research_log_hits)]
-        if not research_log_types and not saw_research_type_filter:
+        if not research_only:
             ranked_lists.extend(
                 [
                     self._normalize_session_record_hits(session_record_hits),
+                    self._normalize_event_hits(event_hits),
                     self._normalize_dynamic_hits(dynamic_hits),
                     self._normalize_knowledge_hits(knowledge_hits),
                 ]
@@ -1760,6 +1777,14 @@ class ContextManager(object):
                     "record_type": str(metadata.get("record_type") or ""),
                     "archive_path": str(metadata.get("archive_path") or ""),
                 }
+            elif source == "session-event":
+                result["local_context"] = self._build_session_context_window(item, query)
+                result["source_refs"] = {
+                    "session_id": str(metadata.get("session_id") or ""),
+                    "record_id": "event:%s" % str(metadata.get("event_id") or ""),
+                    "record_type": str(metadata.get("event_kind") or "event"),
+                    "archive_path": "",
+                }
             elif source == "dynamic":
                 result["local_context"] = self._build_dynamic_context_window(item, query)
                 result["source_refs"] = {
@@ -1779,6 +1804,49 @@ class ContextManager(object):
                 result["source_refs"] = dict(metadata)
             results.append(result)
 
+        compressed_windows: List[Dict[str, object]] = []
+        for item in merged[: max(1, result_limit * 2)]:
+            source = str(item.get("source") or "")
+            metadata = dict(item.get("metadata") or {})
+            if source == "research-log":
+                window_text = self._build_research_context_window(item, query)
+            elif source in {"session", "session-record", "session-event"}:
+                window_text = self._build_session_context_window(item, query)
+            elif source == "dynamic":
+                window_text = self._build_dynamic_context_window(item, query)
+            elif source == "knowledge":
+                window_text = self._build_knowledge_context_window(item, query)
+            else:
+                window_text = str(item.get("text") or "")
+            compressed_windows.append(
+                {
+                    "key": str(item.get("key") or ""),
+                    "source": source,
+                    "title": str(item.get("title") or ""),
+                    "summary": str(
+                        metadata.get("summary") or metadata.get("exact_excerpt") or item.get("text") or ""
+                    ),
+                    "window_excerpt": window_text,
+                }
+            )
+
+        summary_lines: List[str] = []
+        for item in merged[: max(1, result_limit)]:
+            metadata = dict(item.get("metadata") or {})
+            label = str(
+                metadata.get("record_type")
+                or metadata.get("artifact_type")
+                or metadata.get("event_kind")
+                or item.get("source")
+                or "memory"
+            )
+            excerpt = str(
+                metadata.get("exact_excerpt") or metadata.get("summary") or item.get("text") or ""
+            ).strip()
+            line = "[%s] %s" % (label, str(item.get("title") or ""))
+            summary_lines.append("%s\n%s" % (line, excerpt) if excerpt else line)
+        summary = "\n\n".join(line for line in summary_lines if line.strip())
+
         locations: Dict[str, object] = {}
         if project_slug:
             locations["project_research_log"] = self.paths.project_research_log_file(project_slug).relative_to(self.paths.home).as_posix()
@@ -1794,6 +1862,23 @@ class ContextManager(object):
                 "all_projects": bool(all_projects),
                 "types": research_log_types,
             },
+            "project_scope": "all-projects" if all_projects else str(project_slug or ""),
+            "all_projects": bool(all_projects),
+            "types": research_log_types,
+            "channels": [str(item) for item in list(channels or [])],
+            "channel_mode": normalized_channel_mode,
+            "limit_per_channel": result_limit,
+            "prefer_raw": bool(prefer_raw),
+            "summary": summary,
             "results": results,
+            "compressed_windows": compressed_windows,
+            "sources": [dict(item) for item in merged],
+            "research_log_hits": research_log_hits,
+            "research_hits": research_log_hits,
+            "dynamic_hits": self._serialize_dynamic_hit_rows(dynamic_hits),
+            "session_hits": session_hits,
+            "event_hits": event_hits,
+            "knowledge_hits": knowledge_hits,
+            "graph_hits": [],
             "raw_record_locations": locations,
         }

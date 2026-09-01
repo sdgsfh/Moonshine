@@ -371,6 +371,30 @@ SECTION_ALIASES = {
 }
 
 
+RESEARCH_ARTIFACT_LOG_TYPES = {
+    "candidate_problem": "problem",
+    "active_problem": "problem",
+    "problem": "problem",
+    "problem_revision": "problem",
+    "final_problem": "problem",
+    "verified_conclusion": "verified_conclusion",
+    "intermediate_conclusion": "verified_conclusion",
+    "verification": "verification",
+    "verification_report": "verification",
+    "problem_review": "verification",
+    "project_result": "project_result",
+    "final_result": "project_result",
+    "counterexample": "counterexample",
+    "failed_path": "failed_path",
+    "stage_transition": "research_note",
+    "solve_attempt": "research_note",
+    "subgoal_plan": "research_note",
+    "example": "research_note",
+    "toy_example": "research_note",
+    "research_note": "research_note",
+}
+
+
 SKILL_ACTIVITY_HINTS = {
     "literature-survey": "literature_scan",
     "query-memory": "literature_scan",
@@ -1463,15 +1487,73 @@ class ResearchWorkflowManager(object):
         """Archive leftover structural fragments from older project layouts."""
         if not project_slug or not self.paths.project_dir(project_slug).exists():
             return {"project_slug": project_slug, "skipped": True}
+        imported = self._import_legacy_research_state(project_slug)
         archived_recursive = self._cleanup_recursive_projects(project_slug)
         archived_versions = self._archive_version_fragments(project_slug)
         summary = {
             "project_slug": project_slug,
+            "imported_records": imported["records"],
+            "imported_channels": imported["channels"],
+            "imported_verifications": imported["verifications"],
             "archived_recursive_projects": archived_recursive,
             "archived_version_fragments": archived_versions,
             "created_at": utc_now(),
         }
         return summary
+
+    def _import_legacy_research_state(self, project_slug: str) -> Dict[str, int]:
+        """Import pre-research-log legacy records into the canonical stores.
+
+        Legacy `research_state/records.jsonl` entries route by artifact type:
+        verification reports become compact verification digest rows (deduped
+        by verification key) and every other artifact becomes a canonical
+        research_log.jsonl record (deduped by record id). Legacy channel files
+        (`memory/channels/*.jsonl`) are superseded by the research log and are
+        left in place untouched, so `channels` stays at zero.
+        """
+        counts = {"records": 0, "channels": 0, "verifications": 0}
+        records_path = self.paths.project_research_records_file(project_slug)
+        legacy_records = [item for item in read_jsonl(records_path) if isinstance(item, dict)]
+        if not legacy_records:
+            return counts
+        log_records: List[Dict[str, object]] = []
+        for item in legacy_records:
+            artifact_type = str(item.get("artifact_type") or item.get("type") or "").strip()
+            metadata = dict(item.get("metadata") or {})
+            if artifact_type == "verification_report":
+                claim_text = str(metadata.get("claim") or "").strip()
+                if not claim_text:
+                    continue
+                row = self._append_verification_digest(
+                    project_slug,
+                    claim=claim_text,
+                    summary=str(item.get("summary") or ""),
+                    review_status=str(item.get("review_status") or ""),
+                    status=str(item.get("status") or ""),
+                    source_id=str(item.get("id") or ""),
+                    metadata=metadata,
+                    created_at=str(item.get("created_at") or ""),
+                )
+                if row is not None:
+                    counts["verifications"] += 1
+                continue
+            content = str(item.get("content") or item.get("summary") or "").strip()
+            if not content:
+                continue
+            log_records.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "type": normalize_research_log_type(artifact_type or "research_note"),
+                    "title": str(item.get("title") or ""),
+                    "content": content,
+                    "session_id": str(item.get("session_id") or ""),
+                    "created_at": str(item.get("created_at") or ""),
+                }
+            )
+        if log_records:
+            created = self.research_log.append_records(project_slug, log_records)
+            counts["records"] = len(created)
+        return counts
 
     def _remember_recent_artifact(self, state: ResearchWorkflowState, record: Dict[str, object]) -> None:
         """Keep a lightweight rolling window of recent research artifacts in the snapshot."""
@@ -1946,6 +2028,11 @@ class ResearchWorkflowManager(object):
             )
         lines.append(
             "- Use `query_memory` to retrieve project memory from `memory/research_log_index.sqlite`; pass `types=[\"failed_path\"]`, `types=[\"verified_conclusion\"]`, or another research-log type only when the need is type-specific."
+        )
+        lines.append(
+            "- Legacy channel names map onto research-log types: `failed_paths` -> `failed_path`, "
+            "`solve_steps`/`subgoals`/`branch_states`/`special_case_checks`/`novelty_notes` -> `research_note`, "
+            "`final_result` -> `project_result`, `conclusion` -> `verified_conclusion`."
         )
         lines.append(
             "- `research_log.jsonl` is the project-memory source of truth; `by_type/*.md` files are readable views and the SQLite index is rebuildable."
@@ -2868,21 +2955,87 @@ class ResearchWorkflowManager(object):
         set_as_active: bool = False,
         metadata: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        """Deprecated explicit artifact entry point.
+        """Persist one typed research artifact into the project research log.
 
-        Project research memory is managed by the project research-memory pipeline.
+        Explicit artifacts become research_log.jsonl records so `query_memory`
+        can retrieve them through the canonical research-log index. Artifact
+        types map onto research-log types; unknown types fall back to
+        `research_note` via the research-log normalization rules.
         """
+        normalized_artifact = str(artifact_type or "").strip() or "research_note"
+        record_type = RESEARCH_ARTIFACT_LOG_TYPES.get(normalized_artifact) or normalize_research_log_type(normalized_artifact)
+        clean_title = str(title or "").strip() or shorten(str(summary or content or ""), 80) or "Research artifact"
+        body = str(content or "").strip() or str(summary or "").strip()
+        created_at = utc_now()
+        state = self.load_state(project_slug)
+        metadata = dict(metadata or {})
+
+        records: List[Dict[str, object]] = []
+        record_id = ""
+        if body:
+            records = self.research_log.append_records(
+                project_slug,
+                [
+                    {
+                        "type": record_type,
+                        "title": clean_title,
+                        "content": body,
+                        "session_id": session_id,
+                        "created_at": created_at,
+                    }
+                ],
+            )
+            if records:
+                record_id = str(records[0].get("id") or "")
+
+        if normalized_artifact in {"candidate_problem", "active_problem", "problem", "problem_revision"} and (
+            set_as_active or not str(state.active_problem or "").strip()
+        ):
+            self._set_active_problem(
+                state,
+                statement=str(content or "").strip() or str(summary or "").strip() or clean_title,
+                created_at=created_at,
+            )
+        if normalized_artifact == "problem_review":
+            self._update_problem_review(
+                state,
+                title=clean_title,
+                summary=str(summary or "").strip(),
+                review_status=str(review_status or metadata.get("review_status") or "pending"),
+                metadata=metadata,
+                created_at=created_at,
+            )
+        if normalized_artifact == "verification_report":
+            claim_text = str(metadata.get("claim") or "").strip()
+            if claim_text:
+                self._append_verification_digest(
+                    project_slug,
+                    claim=claim_text,
+                    summary=str(summary or "").strip(),
+                    review_status=str(review_status or metadata.get("review_status") or ""),
+                    status=str(status or metadata.get("status") or ""),
+                    source_id=record_id,
+                    metadata=metadata,
+                    created_at=created_at,
+                )
+        if normalized_artifact == "stage_transition":
+            self._apply_stage_transition(state, metadata=metadata, created_at=created_at, summary=str(summary or "").strip())
+        self.save_state(state)
+
         return {
-            "id": "",
-            "artifact_type": str(artifact_type or "").strip(),
-            "title": str(title or "").strip(),
-            "stage": str(stage or ""),
-            "focus_activity": str(focus_activity or ""),
-            "status": "deprecated",
-            "content_path": "",
+            "id": record_id,
+            "artifact_type": normalized_artifact,
+            "record_type": record_type,
+            "title": clean_title,
+            "stage": str(stage or state.stage or ""),
+            "focus_activity": str(focus_activity or state.node or ""),
+            "status": str(status or "recorded"),
+            "review_status": str(review_status or ""),
+            "content_path": "projects/%s/memory/research_log.jsonl" % project_slug,
             "summary": str(summary or ""),
-            "archived": 0,
-            "message": "Explicit artifact recording is disabled; project research memory uses research_log.jsonl.",
+            "archived": 1 if records else 0,
+            "applied": dict(state.transition_status or {}),
+            "message": "Recorded in projects/%s/memory/research_log.jsonl." % project_slug,
         }
 
     def commit_turn(
