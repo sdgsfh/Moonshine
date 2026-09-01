@@ -127,15 +127,6 @@ class AIAgent(object):
             return content
         return ""
 
-    def _configured_offline_provider_message(self) -> str:
-        """Return a concise terminal message for an explicitly offline main provider."""
-        note = str(getattr(self.provider, "note", "") or "").strip()
-        suffix = (" Provider note: %s" % note) if note else ""
-        return (
-            "Research autopilot stopped because the main provider is offline or unavailable.%s\n"
-            "Configure a working provider before continuing research mode."
-        ) % suffix
-
     def _verification_offline_error(self, results: Sequence[Dict[str, object]]) -> str:
         """Return the verification-provider offline tool error text if present."""
         for result in results:
@@ -373,17 +364,22 @@ class AIAgent(object):
             tool_schemas=state.tool_schemas,
         )
         changed = json.dumps(compacted_messages, ensure_ascii=False) != json.dumps(state.provider_messages, ensure_ascii=False)
-        if not changed:
-            return False
-        state.provider_messages = compacted_messages
         state.overflow_recovery_attempts += 1
+        if changed:
+            state.provider_messages = compacted_messages
+        # Even when aggressive compaction cannot shrink the request further,
+        # still retry (bounded by overflow_retry_limit): the local token count
+        # is an estimate and the provider may accept a retried request.
         self._record_turn_event(
             state.session_id,
             "context_overflow_recovery",
-            "Recovered from a context overflow by aggressively compacting history.",
+            "Recovered from a context overflow by aggressively compacting history."
+            if changed
+            else "Context overflow recovery retry; no further compaction was available.",
             phase=phase,
             error=error_text,
             recovery_attempt=state.overflow_recovery_attempts,
+            compaction_changed=bool(changed),
             estimated_tokens=compression_meta.get("estimated_tokens", 0),
             summarized_messages=compression_meta.get("summarized_messages", 0),
             kept_recent_messages=compression_meta.get("kept_recent_messages", 0),
@@ -973,6 +969,7 @@ class AIAgent(object):
                 "created_at": utc_now(),
             }
             self.session_store.append_tool_event(state.session_id, event_payload)
+            self.session_store.append_tool_result_conversation_event(state.session_id, event_payload)
             self._append_turn_transcript(
                 state,
                 {
@@ -1352,26 +1349,9 @@ class AIAgent(object):
         )
         final_already_streamed = False
 
-        if state.mode == "research" and isinstance(self.provider, OfflineProvider):
-            state.final_text = self._configured_offline_provider_message()
-            state.final_reason = "provider_offline"
-            self._append_turn_transcript(
-                state,
-                {
-                    "kind": "assistant_output",
-                    "content": state.final_text,
-                    "source": state.final_reason,
-                    "model_round": state.model_round,
-                },
-            )
-            status_event = self._emit_status(
-                state,
-                "Research autopilot stopped because the main provider is offline or unavailable.",
-                phase="provider_offline",
-            )
-            if status_event is not None:
-                yield status_event
-
+        # An offline main provider still runs one streaming round so the user
+        # sees the deterministic fallback text; the post-stream offline gate
+        # below then ends the turn with final_reason="provider_offline".
         while state.model_round < state.budget.max_model_rounds:
             if state.final_reason == "provider_offline":
                 break

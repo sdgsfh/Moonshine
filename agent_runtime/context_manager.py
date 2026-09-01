@@ -143,12 +143,12 @@ class ContextManager(object):
             kept.append("... [truncated]")
         return "\n".join(line for line in kept if line).strip()
 
-    def _summarize_bounded_text_with_provider(self, *, purpose: str, text: str, token_budget: int) -> str:
+    def _summarize_bounded_text_with_provider(self, *, purpose: str, text: str, token_budget: int, force_provider: bool = False) -> str:
         """Ask the configured provider for one already-bounded source summary."""
         source = str(text or "").strip()
         if not source:
             return ""
-        if self.estimate_tokens(source) <= token_budget:
+        if not force_provider and self.estimate_tokens(source) <= token_budget:
             return source
 
         if not isinstance(self.provider, OfflineProvider):
@@ -201,7 +201,7 @@ class ContextManager(object):
         rendered = "\n".join("- %s" % item for item in bullets if item)
         return self._trim_text_to_budget(rendered or shorten(source, token_budget * 4), token_budget)
 
-    def _summarize_with_provider(self, *, purpose: str, text: str, token_budget: int) -> str:
+    def _summarize_with_provider(self, *, purpose: str, text: str, token_budget: int, force_provider: bool = False) -> str:
         """Compress text through bounded provider calls and concatenate chunk summaries."""
         chunks = split_text_by_token_budget(
             text,
@@ -215,6 +215,7 @@ class ContextManager(object):
                 purpose=purpose,
                 text=chunks[0],
                 token_budget=token_budget,
+                force_provider=force_provider,
             )
         summaries = []
         for index, chunk in enumerate(chunks, start=1):
@@ -222,6 +223,7 @@ class ContextManager(object):
                 purpose="%s chunk %s/%s" % (purpose, index, len(chunks)),
                 text=chunk,
                 token_budget=token_budget,
+                force_provider=force_provider,
             )
             if summary:
                 summaries.append(summary)
@@ -432,10 +434,14 @@ class ContextManager(object):
         chunks = self._chunk_history_by_count(older_messages, chunk_count=chunk_count)
         summaries = []
         for chunk_index, chunk in enumerate(chunks, start=1):
+            # Count-based history chunks are always provider-summarized, even
+            # when a chunk already fits the token budget, so every chunk keeps
+            # a uniform compact research-progress-report shape.
             summary = self._summarize_with_provider(
                 purpose="conversation history chunk %s/%s" % (chunk_index, len(chunks)),
                 text=self._format_history_for_summary(chunk),
                 token_budget=per_chunk_budget,
+                force_provider=True,
             )
             summaries.append(summary)
         return summaries
