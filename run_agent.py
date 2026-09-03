@@ -1542,6 +1542,12 @@ class AIAgent(object):
                     and state.tool_rounds >= state.budget.max_tool_rounds
                 ):
                     state.final_reason = "tool_round_limit_reached"
+                    if round_text:
+                        # The guard drops only the tool_calls; the round's text must
+                        # still join the provider conversation as a plain assistant
+                        # message (no tool_calls, so no orphan risk), otherwise the
+                        # finalization pass cannot see what the model already wrote.
+                        state.provider_messages.append({"role": "assistant", "content": round_text})
                     status_event = self._emit_status(
                         state,
                         "Tool round limit reached; finalizing without more tool execution.",

@@ -11,11 +11,18 @@ reject with HTTP 400 ("insufficient tool messages following tool_calls").
 
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 
 from moonshine.app import MoonshineApp
 from moonshine.providers import ProviderResponse, ProviderStreamEvent, ProviderToolCall
+
+
+def _make_tempdir():
+    """TemporaryDirectory(ignore_cleanup_errors=...) requires Python 3.10+; keep 3.8 compat."""
+    kwargs = {"ignore_cleanup_errors": True} if sys.version_info >= (3, 10) else {}
+    return tempfile.TemporaryDirectory(**kwargs)
 
 
 class ScriptedProvider(object):
@@ -63,7 +70,7 @@ class ProviderMessageSanitizerTest(unittest.TestCase):
     """Unit tests for the send-time sanitizer that guarantees protocol validity."""
 
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.temp_dir = _make_tempdir()
         self.addCleanup(self.temp_dir.cleanup)
         self.app = MoonshineApp(home=self.temp_dir.name)
         self.state = self.app.start_shell_state(mode="research", project_slug="anderson_conjecture")
@@ -179,7 +186,7 @@ class ToolRoundLimitOrphanRegressionTest(unittest.TestCase):
     """Ensure tool-round-limit finalization never produces orphan tool_calls."""
 
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.temp_dir = _make_tempdir()
         self.addCleanup(self.temp_dir.cleanup)
         self.app = MoonshineApp(home=self.temp_dir.name)
         self.state = self.app.start_shell_state(mode="research", project_slug="anderson_conjecture")
@@ -335,6 +342,70 @@ class ToolRoundLimitOrphanRegressionTest(unittest.TestCase):
         executed_call_ids = [e.payload.get("call_id") for e in events if e.type == "tool_call"]
         self.assertEqual(executed_call_ids, ["good-1"])
         self.assertEqual(events[-1].text, "Repair flow done.")
+        self._assert_no_orphan_tool_calls_across_provider_calls(provider)
+
+    def test_tool_round_limit_preserves_capped_round_text_for_finalization(self):
+        """A capped response's text must reach the finalization request context.
+
+        When the model returns text AND tool_calls after the budget is exhausted,
+        the guard must skip the tool_calls (no orphan) but still keep the text as
+        a plain assistant message in the provider conversation — otherwise the
+        finalization pass cannot see what the model already wrote in that round.
+        """
+        self.app.config.agent.max_tool_rounds = 1  # exhaust after the first tool execution
+        self.app.config.agent.max_model_rounds = 6
+
+        provider = ScriptedProvider(
+            [
+                # round 1: a valid tool call -> executes (tool_rounds 0 -> 1, cap reached).
+                {
+                    "response": ProviderResponse(
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="query_memory",
+                                arguments={"query": "first", "project_slug": "anderson_conjecture"},
+                                call_id="call-1",
+                            )
+                        ]
+                    )
+                },
+                # round 2: text + tool call with the cap reached. The tool call is
+                # gated (never appended, never executed); the text must be kept.
+                {
+                    "response": ProviderResponse(
+                        content="CAPPED_ROUND_SENTINEL: local methods suffice.",
+                        tool_calls=[
+                            ProviderToolCall(
+                                name="query_memory",
+                                arguments={"query": "second", "project_slug": "anderson_conjecture"},
+                                call_id="call-2",
+                            )
+                        ],
+                    )
+                },
+                # finalization pass: plain text.
+                {
+                    "chunks": ["Finalized the run."],
+                    "response": ProviderResponse(content="Finalized the run."),
+                },
+            ]
+        )
+        self.app.agent.provider = provider
+
+        events = list(self.app.ask_stream("Run tools until capped with text.", self.state))
+
+        self.assertTrue(any("tool round limit" in event.text.lower() for event in events if event.type == "status"))
+        # The capped round's text is visible in the finalization request context.
+        finalization_messages = provider.calls[-1]["messages"]
+        self.assertTrue(
+            any(
+                message.get("role") == "assistant"
+                and not message.get("tool_calls")
+                and "CAPPED_ROUND_SENTINEL" in str(message.get("content") or "")
+                for message in finalization_messages
+            ),
+            "finalization request did not include the capped round's assistant text",
+        )
         self._assert_no_orphan_tool_calls_across_provider_calls(provider)
 
     def test_tool_round_limit_does_not_leave_orphan_tool_calls(self):
